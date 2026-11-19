@@ -267,9 +267,16 @@ class _KanbanDispatcher:
                 # and spawned subprocess that names no board would resolve this one instead.
                 with scoped_current_board(slug):
                     try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
+                        # Consent-gated cards (unacknowledged operator needs_input
+                        # gate) are filtered out BEFORE the budget loop so they rest
+                        # operator-visible and consume no auto_decompose_per_tick
+                        # budget. Manual CLI/dashboard paths are not filtered.
+                        triage_ids = _decomp.list_auto_decomposable_triage_ids()
+                    except Exception:
+                        logger.debug(
+                            "kanban dispatcher: list_auto_decomposable_triage_ids failed on board %s",
+                            slug, exc_info=True,
+                        )
                         triage_ids = []
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:

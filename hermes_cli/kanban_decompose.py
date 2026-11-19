@@ -341,3 +341,25 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
     return [row.id for row in rows]
+
+
+def list_auto_decomposable_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+    """Triage ids the AUTO-decomposer may act on: ``list_triage_ids`` minus
+    consent-gated cards (unacknowledged operator ``needs_input`` gate).
+
+    Machine sweep only — manual CLI (single-id / --all) and dashboard
+    specify/decompose paths keep using ``list_triage_ids`` / ``decompose_task``
+    and never skip: an operator naming a card is itself consent. Filtering
+    here (before the gateway tick's per-tick budget loop) means held cards
+    consume no ``auto_decompose_per_tick`` budget. One connection; held cards
+    get a deduped ``consent_gate_hold`` event so the silence is explainable.
+    """
+    from hermes_cli import kanban_consent_gate as cg
+
+    with kbc.connect_closing() as conn:
+        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+        ids = [row.id for row in rows]
+        gated = cg.consent_gated_ids(conn, ids)
+        if gated:
+            cg.record_consent_gate_holds(conn, gated)
+    return [tid for tid in ids if tid not in gated]

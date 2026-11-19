@@ -1790,12 +1790,30 @@ def dispatch_profile_allowlist_summary() -> str:
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
     if not rows:
         return False
+    # Consent-gated cards rest operator-visible: they are not spawnable work,
+    # so telemetry must not report the dispatcher "stuck" on a board holding
+    # only gated cards. Pure predicate — no hold events from telemetry.
+    # Exception-safe fail-open: any error falls back to the legacy probe.
+    try:
+        from hermes_cli import kanban_consent_gate as cg
+
+        gated = cg.consent_gated_ids(conn, [row["id"] for row in rows])
+    except Exception:
+        _kb._log.warning(
+            "kanban consent-gate: telemetry probe failed; failing open",
+            exc_info=True,
+        )
+        gated = set()
+    if gated:
+        rows = [row for row in rows if row["id"] not in gated]
+        if not rows:
+            return False
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
@@ -2271,6 +2289,47 @@ def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def _filter_consent_gated(
+    conn: sqlite3.Connection,
+    ready_rows: list[sqlite3.Row],
+    review_rows: list[sqlite3.Row],
+    *,
+    dry_run: bool,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    """Drop consent-gated cards from BOTH lanes, once, after enumeration.
+
+    Filtering here covers both claim loops and the ``_any_spawnable_review``
+    capacity reservation below. Every operator path that lands a gated card
+    in a dispatchable lane writes a release signal (unblock -> ``unblocked``,
+    drag -> ``status``, promote -> ``promoted_manual``, reopen-review ->
+    ``review_reopened``), so ready inclusion is safe; sticky needs_input
+    blocks never auto-promote from ``blocked``.
+    Held cards get one deduped ``consent_gate_hold`` event per gate episode
+    (never on dry-run ticks). Exception-safe fail-open: ANY error (import,
+    roster, SQL) returns the rows unfiltered with a warning — a broken
+    predicate must never stall the dispatch lane.
+    """
+    try:
+        from hermes_cli import kanban_consent_gate as cg
+
+        ids = [row["id"] for row in ready_rows] + [row["id"] for row in review_rows]
+        gated = cg.consent_gated_ids(conn, ids)
+        if not gated:
+            return ready_rows, review_rows
+        if not dry_run:
+            cg.record_consent_gate_holds(conn, gated)
+        return (
+            [row for row in ready_rows if row["id"] not in gated],
+            [row for row in review_rows if row["id"] not in gated],
+        )
+    except Exception:
+        _kb._log.warning(
+            "kanban consent-gate: lane filter failed; failing open (no holds)",
+            exc_info=True,
+        )
+        return ready_rows, review_rows
+
+
 def _any_spawnable_review(
     conn: sqlite3.Connection,
     review_rows: list[sqlite3.Row],
@@ -2356,6 +2415,11 @@ def _dispatch_once_locked(
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    # Consent-gate hold: filter ONCE here so both claim loops AND the
+    # _any_spawnable_review capacity reservation below see the same held set.
+    ready_rows, review_rows = _filter_consent_gated(
+        conn, ready_rows, review_rows, dry_run=dry_run,
+    )
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
