@@ -81,7 +81,9 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         assert row["later_cli"]["rc"] != 0, row
     assert [kb.get_task(conn, t).status for t in (own, foreign)] == ["running", "running"]
     assert json.loads(kanban_tools._handle_complete({"summary": "parent handoff"}))["ok"]
-    assert kb.get_task(conn, own).status == "done"
+    # The parent's own handoff is accepted but routes through a review round
+    # before done (completion review gate).
+    assert kb.get_task(conn, own).status == "review"
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     conn.close()
 

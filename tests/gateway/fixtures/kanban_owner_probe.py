@@ -184,6 +184,16 @@ def main():
                 receipt['source'] = db.execute('SELECT source FROM sessions WHERE id=?', (sid,)).fetchone()[0]
                 receipt['admissions'] = db.execute('SELECT count(*) FROM session_admissions').fetchone()[0]
             with closing(connect(board='owned')) as conn:
+                # The worker's self-completion routed to review (completion
+                # review gate); the review round is what closes the card.
+                routed = kb.get_task(conn, tid)
+                assert routed.status == 'review', receipt
+                receipt['routed_status'] = routed.status
+                review = kb.claim_review_task(conn, tid, claimer='probe-reviewer')
+                assert review is not None
+                assert kb.complete_task(
+                    conn, tid, summary='probe approval',
+                    expected_run_id=review.current_run_id)
                 receipt['task_status'] = kb.get_task(conn, tid).status
             wire = json.dumps(peer.requests)
             turns = [r for r in peer.requests if r.get('tools')]

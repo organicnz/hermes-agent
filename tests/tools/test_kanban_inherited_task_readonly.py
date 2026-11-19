@@ -115,4 +115,7 @@ def test_dispatcher_worker_still_completes_own_card(worker_board):
     worker_tid, _ = worker_board
     out = json.loads(kt._handle_complete({"task_id": worker_tid, "summary": "done"}))
     assert out.get("ok") is True, out
-    assert _status(worker_tid) == "done"
+    # The worker's self-completion is accepted but routes through a review
+    # round before done (completion review gate).
+    assert out.get("status") == "review"
+    assert _status(worker_tid) == "review"

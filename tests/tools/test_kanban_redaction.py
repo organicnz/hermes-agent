@@ -147,7 +147,9 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     finally:
         conn.close()
     assert run is not None
-    assert run.outcome == "completed"
+    # The self-completion routes to review (completion review gate); the
+    # legacy result rides the handoff summary and is scrubbed there.
+    assert run.outcome == "review_requested"
     stored = run.summary or ""
     assert secret not in stored
 

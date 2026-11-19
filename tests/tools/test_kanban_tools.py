@@ -182,13 +182,19 @@ def test_complete_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["task_id"] == worker_env
+    # A worker's self-completion routes through a review round before done
+    # (completion review gate); the payload says so and the handoff evidence
+    # rides the run exactly as a voluntary request_review handoff.
+    assert d["status"] == "review"
+    assert d.get("note") and "review" in d["note"]
     # Verify via kernel
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
+        assert kb.get_task(conn, worker_env).status == "review"
         run = kb.latest_run(conn, worker_env)
-        assert run.outcome == "completed"
+        assert run.outcome == "review_requested"
         assert run.summary == "got the thing done"
         assert run.metadata == {"files": 2}
     finally:
@@ -864,7 +870,9 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
 def test_worker_lifecycle_through_tools(worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
-    the dispatcher/notifier expect."""
+    the dispatcher/notifier expect. The worker's self-completion routes to
+    review (completion review gate); a review round closes the card and only
+    then does the fan-in child promote."""
     from tools import kanban_tools as kt
 
     # 1. show — worker orientation
@@ -888,35 +896,51 @@ def test_worker_lifecycle_through_tools(worker_env):
     }))
     assert child_out["ok"]
 
-    # 5. complete with structured handoff
+    # 5. complete with structured handoff — the gate routes the worker's
+    # self-completion to review; the card closes only via the review round.
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
         "metadata": {"child_task": child_out["task_id"]},
     }))
     assert comp["ok"]
+    assert comp["status"] == "review"
 
-    # Verify final state
+    # Verify the routed state
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
         parent = kb.get_task(conn, worker_env)
-        assert parent.status == "done"
+        assert parent.status == "review"
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
-        assert run.outcome == "completed"
+        assert run.outcome == "review_requested"
         assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child is todo (parent just finished, but recompute_ready may
-        # have promoted it — complete_task runs recompute internally).
+        # Child stays todo: fan-in promotion waits for the parent to reach
+        # done, which now requires the review round to close it.
         child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "ready", (
-            f"child should be ready after parent done, got {child.status}"
+        assert child.status == "todo", (
+            f"child should wait for the parent's review round, got {child.status}"
         )
         # Comment is visible
         assert len(kb.list_comments(conn, worker_env)) == 1
         # Heartbeat event recorded
         hb = [e for e in kb.list_events(conn, worker_env) if e.kind == "heartbeat"]
         assert len(hb) == 1
+
+        # 6. the review round closes the card — the compliant path is
+        # unchanged, and only now does the fan-in child promote.
+        review = kb.claim_review_task(conn, worker_env, claimer="reviewer:1")
+        assert review is not None
+        assert kb.complete_task(
+            conn, worker_env, summary="approved after verification",
+            expected_run_id=review.current_run_id,
+        ) is True
+        assert kb.get_task(conn, worker_env).status == "done"
+        child = kb.get_task(conn, child_out["task_id"])
+        assert child.status == "ready", (
+            f"child should be ready after parent done, got {child.status}"
+        )
     finally:
         conn.close()
 

@@ -725,11 +725,22 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             task for task in globally_capped.spawned if task[0] in review_ids
         ]
 
+        # Close the running card through a review round: a worker's direct
+        # self-completion now routes to review (completion review gate) and
+        # would itself consume the freed review slot.
+        assert kb.request_review(
+            conn,
+            running_id,
+            summary="done",
+            expected_run_id=running.current_run_id,
+        )
+        running_review = kb.claim_review_task(conn, running_id)
+        assert running_review is not None
         assert kb.complete_task(
             conn,
             running_id,
             result="done",
-            expected_run_id=running.current_run_id,
+            expected_run_id=running_review.current_run_id,
         )
         global_dry_run = kbd.dispatch_once(
             conn,
