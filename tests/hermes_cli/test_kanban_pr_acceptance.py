@@ -122,10 +122,18 @@ def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
                     assert kb.unblock_task(rival, tid)
                     github["replacement"] = kb.claim_task(rival, tid).current_run_id
             github.update(conclusion=conclusion, race=reclaim)
-            assert not kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
+            # The worker's self-completion routes to review before any
+            # acceptance collection (completion review gate); the ownership
+            # race fires on the reviewer's approval, which carries the PR
+            # contract check.
+            assert kb.complete_task(conn, tid, result="done", expected_run_id=run_id,
+                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+            assert kb.get_task(conn, tid).status == "review"
+            review = kb.claim_review_task(conn, tid)
+            assert not kb.complete_task(conn, tid, result="approved", expected_run_id=review.current_run_id,
                 metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).current_run_id == github["replacement"]
-            assert github["replacement"] != run_id
+            assert github["replacement"] != review.current_run_id
             assert kb.get_task(conn, tid).status != "done"
             assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
             github.pop("race")

@@ -48,11 +48,16 @@ def test_claimless_complete_refuses_live_run_until_forced(conn):
     with pytest.raises(kb.LiveClaimError):
         kb.complete_task(conn, tid, result="someone else says done")
 
-    # Nothing moved: the worker's run is still open and it can still finish its own card.
+    # Nothing moved: the worker's run is still open and it can still finish
+    # its own card — a self-completion now lands in review (the completion
+    # review gate routes it through a review round instead of done).
     run = conn.execute("SELECT ended_at FROM task_runs WHERE id = ?", (run_id,)).fetchone()
     assert run["ended_at"] is None
     assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "running"
     assert kb.complete_task(conn, tid, result="worker done", expected_run_id=run_id) is True
+    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "review"
+    run = conn.execute("SELECT ended_at, outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["ended_at"] is not None and run["outcome"] == "review_requested"
 
     # Explicit operator override still closes a live run.
     tid2, run2 = _claimed_running_task(conn)

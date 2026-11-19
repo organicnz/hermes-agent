@@ -54,8 +54,13 @@ with tempfile.TemporaryDirectory(prefix='hermes-pr-live-') as home:
                         kb.unblock_task(other, tid)
                         state['replacement'] = kb.claim_task(other, tid).current_run_id
                 state.update(conclusion=outcome, race=reclaim)
-                accepted = kb.complete_task(conn, tid, expected_run_id=run_id, metadata={'published_pr': 'https://github.com/acme/repo/pull/7'})
-                reports.append({'case': 'CAS-'+outcome, 'accepted': accepted, 'run_id': kb.get_task(conn, tid).current_run_id,
+                # Worker self-completion routes to review before any
+                # acceptance collection (completion review gate); the
+                # ownership race fires on the reviewer's approval.
+                routed = kb.complete_task(conn, tid, expected_run_id=run_id, metadata={'published_pr': 'https://github.com/acme/repo/pull/7'})
+                review = kb.claim_review_task(conn, tid)
+                accepted = kb.complete_task(conn, tid, expected_run_id=review.current_run_id, metadata={'published_pr': 'https://github.com/acme/repo/pull/7'})
+                reports.append({'case': 'CAS-'+outcome, 'routed': routed, 'accepted': accepted, 'run_id': kb.get_task(conn, tid).current_run_id,
                     'receipts': conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0]})
                 del state['race']
         print(json.dumps({'reports': reports, 'requests': state['requests']}, indent=2))

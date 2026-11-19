@@ -2659,11 +2659,21 @@ def complete_task(
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
+
+    A worker's direct self-completion (``expected_run_id`` matching the current
+    run, no ``force``) from a non-review status cannot reach ``done``: it is
+    machine-routed to ``review`` via
+    :func:`kanban_db_completion_gate.route_worker_completion`, and a refused
+    routing fails closed. Review approvals, claimless manual completions and
+    ``force`` overrides keep their semantics.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_db_completion_gate import (
+        _gate_empty_completion, route_worker_completion,
+    )
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -2671,6 +2681,15 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # A worker's direct self-completion must not reach done without a review
+    # round: route it through the review handoff, fail-closed on refusal.
+    if not force:
+        routed = route_worker_completion(
+            conn, task_id, summary=handoff_summary, metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if routed is not None:
+            return routed
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2768,44 +2787,6 @@ def _gate_created_cards(
             )
         raise HallucinatedCardsError(phantom_cards, task_id)
     return verified_cards
-
-
-def _substantive_text(value: Optional[str]) -> bool:
-    return bool(value is not None and str(value).strip())
-
-
-def _gate_empty_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    result: Optional[str],
-    summary: Optional[str],
-) -> None:
-    """Refuse a completion that would leave the card with no evidence.
-
-    Review approvals are exempt: a human vouches for the card and
-    ``_REVIEW_APPROVED_NOTE`` is the documented record.
-    """
-    row = conn.execute(
-        "SELECT status, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return
-    if row["status"] == "review":
-        return
-    stored = row["result"]
-    if _substantive_text(result) or _substantive_text(summary) or _substantive_text(stored):
-        return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "completion_blocked_empty_result",
-            {
-                "result_preview": _first_line(result, 200) or None,
-                "summary_preview": _first_line(summary, 200) or None,
-            },
-        )
-    raise EmptyCompletionError(task_id)
 
 
 def _stage_completion_artifacts(

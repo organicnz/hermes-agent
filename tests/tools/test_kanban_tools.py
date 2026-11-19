@@ -197,8 +197,9 @@ def test_complete_happy_path(worker_env):
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
-    created_cards=[] (the documented escape hatch) must complete the
-    task. Regression for #22923."""
+    created_cards=[] (the documented escape hatch) must be accepted.
+    Regression for #22923. The acceptance now lands in review: a worker's
+    self-completion routes through a review round before done."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
@@ -216,10 +217,11 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         "created_cards": [],
     }))
     assert ok.get("ok") is True
+    assert ok.get("status") == "review"  # routed, not done
 
     conn = kbc.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "done"
+        assert kb.get_task(conn, worker_env).status == "review"
     finally:
         conn.close()
 
@@ -248,8 +250,11 @@ def test_complete_reports_registered_attachments(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True, d
+    # The self-completion routed to review; the review handoff stages the
+    # artifacts under its own uploader label.
+    assert d["status"] == "review"
     assert [(a["filename"], a["size"], a["uploaded_by"]) for a in d["attachments"]] == [
-        ("corpus.json", 2, "kanban_complete")]
+        ("corpus.json", 2, "kanban_request_review")]
 
     readback = json.loads(kt._handle_attachments({"task_id": worker_env}))
     assert readback["attachments"] == d["attachments"]
@@ -326,15 +331,16 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
         assert task.status == "running"
         assert task.current_run_id is not None
 
-    # A bound worker (run id present) still completes normally — the guard only
-    # fires on the unbound state, never on the legitimate dispatcher path.
+    # A bound worker (run id present) still completes — the guard only fires
+    # on the unbound state, never on the legitimate dispatcher path. Its
+    # self-completion routes to review (completion review gate), not done.
     with kbc.connect() as conn:
         run_id = kb.get_task(conn, worker_env).current_run_id
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     out = json.loads(kt._handle_complete({"summary": "bound worker done"}))
     assert out.get("ok") is True
     with kbc.connect() as conn:
-        assert kb.get_task(conn, worker_env).status == "done"
+        assert kb.get_task(conn, worker_env).status == "review"
 
 
 def test_malformed_run_id_refused_but_nonlifecycle_allowed(monkeypatch, worker_env):

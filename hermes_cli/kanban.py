@@ -941,7 +941,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
             return done
 
-        return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
+        def ok_msg(tid):
+            landed = kb.get_task(conn, tid)
+            if landed is not None and landed.status == "review":
+                return f"Routed {tid} to review (review round required)"
+            return f"Completed {tid}"
+
+        return _bulk_apply(ids, op, ok_msg, fail_msg.__getitem__)
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
