@@ -358,6 +358,9 @@ _SPECS = [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
              help="Permanently delete already-archived task ids from the board"),
+        _arg("--pin", dest="pin",
+             help="Named PIN exception: allow archiving a card with no handoff "
+                  "on the record (recorded as an archive_pinned event)"),
     ], help="Archive one or more tasks"),
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [

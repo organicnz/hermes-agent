@@ -638,7 +638,13 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     (naming the blocking parent(s) for ``ready``/``done``/``review`` so the UI renders an actionable toast)."""
     s = payload.status
     if s == "archived":
-        ok = kanban_db.archive_task(conn, task_id)
+        if not kanban_db.archive_task(conn, task_id):
+            raise _conflict(
+                "Cannot archive: no handoff on the record — complete the card "
+                "first, or archive with a named PIN: hermes kanban archive "
+                f"{task_id} --pin <name>"
+            )
+        return
     else:
         with _map_errors(400, _StatusRejected, ValueError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
@@ -829,7 +835,7 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
     """Apply the bulk patch to one task, recording refusals in ``entry`` without aborting the
     remaining ops — except a rejected status verb (``_StatusRejected`` propagates)."""
     if payload.archive and not kanban_db.archive_task(conn, tid):
-        entry.update(ok=False, error="archive refused")
+        entry.update(ok=False, error="archive refused (no handoff on record — use CLI --pin <name>)")
     if payload.status is not None and not payload.archive:
         s = payload.status
         if not _apply_status(conn, tid, s, payload, f"unknown status {s!r}"):

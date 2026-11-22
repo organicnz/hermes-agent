@@ -1136,8 +1136,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
-                           lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+        pin = getattr(args, "pin", None)
+        fail = (lambda tid: f"cannot archive {tid}") if pin else (
+            lambda tid: f"cannot archive {tid} (no handoff on the record — "
+                        "complete the card first or pass --pin <name>)")
+        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid, pin=pin),
+                           lambda tid: f"Archived {tid}", fail)
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

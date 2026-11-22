@@ -750,6 +750,11 @@ def test_dashboard_confirm_dispatches_expected_patch_body(client):
 def test_bulk_archive(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
+    # Archiving is gated: each card carries its completion handoff first.
+    for t in (a, b):
+        r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}",
+                         json={"status": "done", "result": "shipped", "summary": "shipped"})
+        assert r.status_code == 200, r.text
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"]], "archive": True})
     assert r.status_code == 200

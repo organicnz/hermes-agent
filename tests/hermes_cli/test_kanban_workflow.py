@@ -44,8 +44,12 @@ def _all_tool_schemas():
             yield value
 
 
-def test_archive_is_always_a_manual_move():
-    assert all(W.can_move(k, kw.ARCHIVED) for k in W.keys())
+def test_archive_is_a_gated_manual_move():
+    # Only a ``done`` card (which by construction carries its completion
+    # handoff) may be archived by manual move; a live handoff-less card
+    # needs a named PIN (CLI ``archive --pin``).
+    assert W.can_move("done", kw.ARCHIVED)
+    assert not any(W.can_move(k, kw.ARCHIVED) for k in W.keys() if k != "done")
     assert not any(W.can_move(k, "running") for k in W.keys())
 
 

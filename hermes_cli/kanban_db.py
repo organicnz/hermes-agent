@@ -2604,6 +2604,27 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class UnpushedArtifactError(ValueError):
+    """``complete_task`` refused: the declared landing (``repo`` + ``ref`` +
+    ``sha``) is not verified on the named ref of ``origin`` — the artifact
+    is local-only (a dangling worktree commit, the t_b4510271 class) or on a
+    different ref. The completion is the moment a landing becomes canonical;
+    an unverified push is a false-completion, so the gate fails closed. A
+    ``ValueError`` so tool error handlers treat it as recoverable: push the
+    artifact, then complete again."""
+
+    def __init__(self, task_id: str, *, ref: str = "", sha: str = "", reason: str = ""):
+        self.task_id = task_id
+        self.ref = ref
+        self.sha = sha
+        self.reason = reason
+        super().__init__(
+            f"completion blocked: {task_id} declared landing {sha[:12] or '?'} on "
+            f"origin/{ref or '?'} is not verified on the ref ({reason}); push the "
+            "artifact to the named ref and complete again"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2672,11 +2693,14 @@ def complete_task(
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_db_completion_gate import (
-        _gate_empty_completion, route_worker_completion,
+        _gate_empty_completion, _gate_unpushed_artifact, route_worker_completion,
     )
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    # A declared landing must be on the named ref of origin before the card
+    # may close: the dangling-42c2b998 class refused fail-closed here.
+    _gate_unpushed_artifact(conn, task_id, metadata=metadata)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -3767,8 +3791,15 @@ def specify_triage_task(
     return True
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None,
+                 pin: Optional[str] = None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
+
+    The archive is gated: a terminal transition must leave a record of what
+    happened (a ``completed`` event with a substantive summary, or a stored
+    ``result``) or a named PIN exception (``pin``) recorded as an
+    ``archive_pinned`` event — the 4/12 unguarded-archive class is refused
+    fail-closed with an ``archive_blocked_no_handoff`` event.
 
     Clearing ``worker_pid`` in the DB alone left the OS process running past its
     own archive — it kept executing (and pushing work) against a task nothing
@@ -3781,6 +3812,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    from hermes_cli.kanban_db_completion_gate import _gate_archive_handoff
+    if not _gate_archive_handoff(conn, task_id, pin=pin):
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",

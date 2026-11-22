@@ -63,7 +63,7 @@ def _task_in(client, src: str) -> str:
         elif src == "done":
             assert kb.complete_task(conn, tid, summary="s", force=True)
         elif src == kw.ARCHIVED:
-            assert kb.archive_task(conn, tid)
+            assert kb.archive_task(conn, tid, pin="matrix_fixture_no_handoff")
         assert kb.get_task(conn, tid).status == src
     return tid
 

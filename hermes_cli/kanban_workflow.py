@@ -45,8 +45,11 @@ class Workflow:
     """Columns (board order) and the manual move allow-list."""
 
     columns: tuple[Column, ...]
-    # Manual moves (drag, PATCH status) a human may request: ``src -> {dst}``. Archiving
-    # (dst) is always allowed and not listed; ``archived`` may appear as a source (restore). Allowed != guaranteed: verbs still apply their own
+    # Manual moves (drag, PATCH status) a human may request: ``src -> {dst}``.
+    # Archiving (dst) is not listed; ``can_move`` allows it only from ``done``
+    # (a done card carries its completion handoff; a live handoff-less card
+    # needs a named PIN, CLI ``archive --pin``). ``archived`` may appear as a
+    # source (restore). Allowed != guaranteed: verbs still apply their own
     # gates (parents open, completion evidence).
     manual: Mapping[str, frozenset[str]]
 
@@ -67,14 +70,18 @@ class Workflow:
         return col
 
     def can_move(self, src: str, dst: str) -> bool:
-        """True when a human may request ``src -> dst``. Archiving is always allowed;
-        ``archived`` is a valid source (restore). ``src == dst`` is not a move."""
+        """True when a human may request ``src -> dst``. Archiving is a verb
+        gate, not a transition rule: only a ``done`` card (which by
+        construction carries its completion handoff) may be archived by
+        manual move; archiving a live handoff-less card needs a named PIN
+        (CLI ``archive --pin``). ``archived`` is a valid source (restore).
+        ``src == dst`` is not a move."""
         if src != ARCHIVED:
             self._require(src)
         if src == dst:
             return False
         if dst == ARCHIVED:
-            return True
+            return src == "done"
         self._require(dst)
         return dst in self.manual.get(src, frozenset())
 
