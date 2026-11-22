@@ -1136,7 +1136,31 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
-    with _board(args.get("board")) as (kb, conn):
+    # Foodshare-scoped cards silently landed on the session's current board (usually
+    # `default`) when no `board` param was given — 3 incidents dropped them off the
+    # foodshare wave's dispatch/review. Route obvious foodshare cards to the foodshare
+    # board when no board is specified. Fail-open (any lookup error keeps current
+    # behaviour) and conservative (title marker only; the standing rule — always pass
+    # board='foodshare' explicitly — remains the primary defence for cards whose title
+    # does not carry the marker).
+    board = args.get("board")
+    _foodshare_routed = False
+    if board is None and "foodshare" in str(title).lower():
+        try:
+            from hermes_cli.kanban_db import board_exists, get_current_board
+            _current = get_current_board()
+            if board_exists("foodshare") and _current != "foodshare":
+                board = "foodshare"
+                _foodshare_routed = True
+                logger.warning(
+                    "kanban_create: foodshare-scoped card routed to 'foodshare' board "
+                    "(no board param given; silent default would have been '%s')",
+                    _current,
+                )
+        except Exception:
+            board = args.get("board")
+            _foodshare_routed = False
+    with _board(board) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1161,7 +1185,7 @@ def _handle_create(args: dict, **kw) -> str:
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
-            board=args.get("board"),
+            board=board,
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
             idempotency_key=args.get("idempotency_key"),
@@ -1171,6 +1195,19 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
+        if _foodshare_routed:
+            # Make the auto-route auditable on the card itself so the wave knows why it
+            # is on the foodshare board (and can re-file with an explicit board if not).
+            try:
+                kb.add_comment(
+                    conn, new_tid, author="kanban-router",
+                    body="Auto-routed to the foodshare board: the title is "
+                         "foodshare-scoped and no board param was given (the silent "
+                         "default would have been the session's current board). Re-file "
+                         "with an explicit board if it belongs elsewhere.",
+                )
+            except Exception:
+                logger.debug("kanban_create: failed to add routing note", exc_info=True)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}

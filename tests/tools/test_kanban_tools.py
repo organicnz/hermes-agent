@@ -780,7 +780,62 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
         return result["workspace_kind"], result["project_id"]
 
     assert create(**explicit) == ("scratch", None)
-    assert create() == (("worktree", project_id) if target_scoped else ("scratch", None))
+    assert create() == ((("worktree", project_id) if target_scoped else ("scratch", None)))
+
+
+def test_create_foodshare_scoped_no_board_routes_to_foodshare(worker_env):
+    """t_98b1929f: a foodshare-scoped card created without a board param must land
+    on the foodshare board, not silently on the session's current board (default)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    kb.create_board("foodshare", name="Foodshare")
+    out = json.loads(kt._handle_create({
+        "title": "foodshare-web: rework cover credit", "assignee": "peer",
+    }))
+    assert out["ok"] is True
+    tid = out["task_id"]
+    with kbc.connect(board="foodshare") as conn:
+        assert kb.get_task(conn, tid) is not None
+    with kbc.connect(board="default") as conn:
+        assert kb.get_task(conn, tid) is None
+
+
+def test_create_non_foodshare_no_board_stays_on_current(worker_env):
+    """t_98b1929f regression: the guard must not move non-foodshare cards — a card
+    without the marker still lands on the session's current board (default)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    kb.create_board("foodshare", name="Foodshare")
+    out = json.loads(kt._handle_create({"title": "nightly lac audit", "assignee": "peer"}))
+    assert out["ok"] is True
+    tid = out["task_id"]
+    with kbc.connect(board="default") as conn:
+        assert kb.get_task(conn, tid) is not None
+    with kbc.connect(board="foodshare") as conn:
+        assert kb.get_task(conn, tid) is None
+
+
+def test_create_explicit_board_wins_over_foodshare_route(worker_env):
+    """t_98b1929f: an explicit board param always wins — a foodshare-titled card with
+    board='default' stays on default (the guard must not override an explicit board)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    kb.create_board("foodshare", name="Foodshare")
+    out = json.loads(kt._handle_create({
+        "title": "foodshare-web: thing", "assignee": "peer", "board": "default",
+    }))
+    assert out["ok"] is True
+    tid = out["task_id"]
+    with kbc.connect(board="default") as conn:
+        assert kb.get_task(conn, tid) is not None
+    with kbc.connect(board="foodshare") as conn:
+        assert kb.get_task(conn, tid) is None
 
 
 def test_link_running_child_allows_owner_but_rejects_foreign(monkeypatch, worker_env):
