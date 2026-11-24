@@ -20,10 +20,15 @@ class HostedControls:
         if (task is None or task['execution_generation'] != execution_generation
                 or task_member_id(task) != member_id):
             raise RuntimeStoreError('stale_generation')
+        members = self._room(room_id)['members']
+        if not any(m.get('member_id') == member_id for m in members):
+            raise RuntimeStoreError('permission_denied')
         if not any(m.get('member_id') == member_id
                    and m.get('profile') == task['payload']['target_profile']
-                   for m in self._room(room_id)['members']):
-            raise RuntimeStoreError('permission_denied')
+                   for m in members):
+            # The member is seated, but this attempt predates a profile rename. Its frozen
+            # target_profile no longer names a home, so the card is stale, not forbidden.
+            raise RuntimeStoreError('stale_generation')
         return task, HostedRoomBinding(room_id, gateway, epoch)
 
     def discard_room_task(self, room_id, *, member_id, task_id, execution_generation):
@@ -105,11 +110,21 @@ class HostedControls:
             # while leaving the canonical unknown head behind it.
             if task['status'] == 'indeterminate':
                 raise RuntimeStoreError('unknown_execution')
-            if task['status'] != 'deferred':
+            if task['status'] == 'failed':
+                # A turn its own deadline stopped never reached a verdict; every other
+                # failure (member unavailable, superseded, unknown) stays terminal.
+                if not tasks.is_retryable_failure(task):
+                    raise RuntimeStoreError('stale_generation')
+                if local:
+                    lease = self.runtime._ensure_lease(binding)
+                    return self.runtime._requeue(tasks.requeue_failed_task, task, lease, room_id)
+            elif task['status'] != 'deferred':
                 raise RuntimeStoreError('stale_generation')
-            if local:
+            elif local:
                 lease = self.runtime._ensure_lease(binding)
                 return self.runtime._requeue(tasks.requeue_deferred_task, task, lease, room_id)
+        # A peer's turn is reopened by the runtime: never under the policy lock, since it waits
+        # on the member's gateway.
         return self._retry_peer(binding, task)
 
     def _local_retry_probe(self, room_id, member_id, task_id, execution_generation):
@@ -162,12 +177,23 @@ class HostedControls:
                 exc.error_code if exc.error_code in _GRANT_ERRORS else 'peer_unreachable') from exc
 
     def _attempt_actions(self, room_id, tasks_shown):
-        """Exact controls on this gateway: Discard an unknown attempt, Retry a deferred one. A peer
-        member's unknown attempt is the peer's to control; its deferred one offers Retry and Discard.
-        Reads only the rows ``status`` already selected."""
+        """Exact controls on this gateway: Discard an unknown attempt, Retry a deferred one or one
+        stopped at its own deadline. A peer member's unknown attempt is the peer's to control; its
+        deferred one offers Retry and Discard. Reads only the rows ``status`` already selected."""
+        members = self._room(room_id)['members']
         actions = []
         for task in tasks_shown:
+            # A profile rename leaves old attempts frozen under the previous profile. They cannot
+            # resolve to a home, so never offer a control that would only answer permission_denied.
+            if not any(m.get('member_id') == task_member_id(task)
+                       and m.get('profile') == task['payload']['target_profile']
+                       for m in members):
+                continue
             if task['status'] not in {'indeterminate', 'deferred'}:
+                # A terminal failure is Retryable only when the clock cut the turn off: the
+                # work never reached a verdict, so Retry is implied by the failure itself.
+                if tasks.is_retryable_failure(task):
+                    actions.append(attempt_action('retry', task))
                 continue
             peer = self._member_is_peer(room_id, task_member_id(task))
             if task['status'] == 'indeterminate' and peer:

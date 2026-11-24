@@ -294,7 +294,8 @@ def test_peer_completion_is_observed_after_the_first_recovery_probe(tmp_path, mo
 
 def test_a_recovered_peer_turn_still_running_is_stopped_at_its_execution_deadline(tmp_path, monkeypatch):
     """A peer run that keeps going holds the room only until the turn's own time limit, measured
-    from when it started; then it is stopped through the exact Stop protocol and fails."""
+    from when it started; then it is stopped through the exact Stop protocol and the room reopens
+    the turn itself (the implied retry) instead of idling on a failure."""
     stops, peer = [], _RecoveringPeerClient()
     turn = _crashed_turn(tmp_path, peer, indeterminate_defer_seconds=60, turn_timeout_seconds=300)
     service, db, identity, binding, lease, now = (
@@ -315,8 +316,10 @@ def test_a_recovered_peer_turn_still_running_is_stopped_at_its_execution_deadlin
     service.runtime._reconcile_indeterminate(binding, lease)
     stopped = driver.get_task(db, identity)
     assert [(s["task_id"], s["execution_generation"]) for s in stops] == [(identity.task_id, 1)]
-    assert (stopped["status"], stopped["execution_generation"]) == ("failed", 1)
-    assert stopped["result"]["reason_code"] == "turn_deadline_exceeded"
+    # Inside the attempt budget the deadline stop is not a verdict: the row is queued again with its
+    # deadline marker and settlement cleared, ready for a fresh attempt without anyone clicking.
+    assert (stopped["status"], stopped["execution_generation"]) == ("queued", 1)
+    assert stopped["result"] is None and stopped["cancel_id"] is None
     assert "room-1" not in service.runtime.status()["blocked_rooms"]
 
 

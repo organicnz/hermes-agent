@@ -124,7 +124,7 @@ class HostedRoomRuntime:
         active_poll_interval_seconds: float = 0.25, turn_timeout_seconds: float = 1830.0,
         indeterminate_defer_seconds: float = 60.0, max_concurrent_rooms: int = 4,
         unavailable_retry_min_seconds: float = 1.0, unavailable_retry_max_seconds: float = 30.0,
-        process_generation: str | None = None) -> None:
+        deadline_retry_attempts: int = 1, process_generation: str | None = None) -> None:
         positive = dict(
             lease_ttl_seconds=lease_ttl_seconds, poll_interval_seconds=poll_interval_seconds,
             active_poll_interval_seconds=active_poll_interval_seconds,
@@ -138,6 +138,9 @@ class HostedRoomRuntime:
             raise ValueError("max_concurrent_rooms must be a positive integer")
         if not 0 < unavailable_retry_min_seconds <= unavailable_retry_max_seconds:
             raise ValueError("unavailable retry bounds are invalid")
+        if (not isinstance(deadline_retry_attempts, int) or isinstance(deadline_retry_attempts, bool)
+                or deadline_retry_attempts < 1):
+            raise ValueError("deadline_retry_attempts must be a positive integer")
         if rpc is None and transport_resolver is None:
             raise ValueError("rpc or transport_resolver is required")
         self.db_path = Path(db_path)
@@ -150,6 +153,9 @@ class HostedRoomRuntime:
         for name, value in positive.items():
             setattr(self, name, float(value))
         self.max_concurrent_rooms = max_concurrent_rooms
+        # Total attempts a deadline may consume before the turn settles as failed: one attempt plus
+        # ``deadline_retry_attempts - 1`` implied retries. 1 keeps the old single-shot behavior.
+        self.deadline_retry_attempts = deadline_retry_attempts
         self.unavailable_retry_min_seconds, self.unavailable_retry_max_seconds = (
             float(unavailable_retry_min_seconds), float(unavailable_retry_max_seconds))
         self.process_generation = process_generation or uuid.uuid4().hex
@@ -275,18 +281,26 @@ class HostedRoomRuntime:
 
     def retry_indeterminate(
         self, identity: state.TaskIdentity, *, execution_generation: int | None = None) -> dict[str, Any]:
-        """Explicitly retry one uncertain attempt under the current room lease."""
+        """Explicitly retry one uncertain attempt, or one stopped at its time limit, under the current
+        room lease."""
         task = state.get_task(self.db_path, identity)
         # The write below fences on this re-read generation, so pinning it to the
         # caller's selected attempt keeps a stale Retry off a newer attempt.
         if execution_generation not in (None, task["execution_generation"]):
             raise state.StaleTaskError("task attempt changed before retry")
-        if task["status"] not in {"indeterminate", "deferred"}:
+        if task["status"] not in {"indeterminate", "deferred", "failed"}:
             raise state.InvalidTaskTransitionError(f"cannot retry task in state '{task['status']}'")
         binding = self._binding_for_room(identity.room_id)
         if binding is None:
             raise state.RoomUnavailableError("hosted room is unavailable")
         lease = self._ensure_lease(binding)
+        if task["status"] == "failed":
+            # A turn its own deadline stopped never reached a verdict (a member may well have been
+            # retrying when the clock ran out), so this Retry reopens exactly that attempt; any
+            # other failure stays terminal.
+            if not state.is_retryable_failure(task):
+                raise state.InvalidTaskTransitionError(f"cannot retry task in state '{task['status']}'")
+            return self._requeue(state.requeue_failed_task, task, lease, identity.room_id)
         if task["status"] == "deferred":
             return self._retry_deferred(binding, task, lease)
         # Explicit Retry may resume the exact stored session; the automatic abandoned-attempt
@@ -997,15 +1011,27 @@ class HostedRoomRuntime:
     def _complete_acknowledged_stop(
         self, binding: HostedRoomBinding, task: Mapping[str, Any], lease: state.DriverLease
     ) -> dict[str, Any]:
-        """Terminalize an acknowledged Stop: deadline stops publish an explicit failure."""
-        if not str(task.get("cancel_id") or "").startswith("deadline:"):
+        """Terminalize an acknowledged Stop: a deadline stop reopens the turn while its budget lasts."""
+        if not str(task.get("cancel_id") or "").startswith(state.DEADLINE_CANCEL_PREFIX):
             return self._complete_cancel(task)
+        if int(task["execution_generation"]) < self.deadline_retry_attempts:
+            # The deadline cut off work that never reached a verdict and the Stop was acknowledged,
+            # so the retry is implied: the room reopens the turn itself instead of idling on a
+            # failure until someone clicks. Past the budget the failure (and its Retry) stays.
+            retried = self._requeue(state.requeue_deadline_task, task, lease, task["identity"].room_id)
+            logger.info(
+                "hosted room %s task %s: deadline stop reopened the turn automatically "
+                "(attempt %d of %d, %.0fs limit)",
+                task["identity"].room_id, task["identity"].task_id,
+                int(task["execution_generation"]), self.deadline_retry_attempts,
+                self.turn_timeout_seconds)
+            return retried
         return self._fenced(
             state.settle_stopping_task, binding, task, lease,
-            settlement_id=f"deadline:{int(task['execution_generation'])}", status="failed",
+            settlement_id=f"{state.DEADLINE_CANCEL_PREFIX}{int(task['execution_generation'])}", status="failed",
             result={
                 "error": "This Group Chat turn exceeded its configured time limit and was stopped.",
-                "reason_code": "turn_deadline_exceeded",
+                "reason_code": state.TURN_DEADLINE_REASON,
                 "timeout_seconds": self.turn_timeout_seconds})
 
     def _expire_attempt_deadline(
@@ -1015,12 +1041,12 @@ class HostedRoomRuntime:
         if task["status"] in {"running", "indeterminate"}:
             task = state.begin_task_cancel(
                 self.db_path, task["identity"], clock=self.clock,
-                cancel_id=f"deadline:{int(task['execution_generation'])}",
+                cancel_id=f"{state.DEADLINE_CANCEL_PREFIX}{int(task['execution_generation'])}",
                 expected_cancel_generation=int(task["cancel_generation"]))
         elif task["status"] != "stopping":
             return
         # A user Stop that won the race keeps its own cancellation semantics.
-        if not str(task.get("cancel_id") or "").startswith("deadline:"):
+        if not str(task.get("cancel_id") or "").startswith(state.DEADLINE_CANCEL_PREFIX):
             return
         lease = self._renew_lease_if_needed(lease, force=True)
         if not self._finish_stop(binding, task, lease):

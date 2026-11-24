@@ -43,6 +43,9 @@ _TERMINAL_STATUSES = ("deferred", "settled", "failed", "cancelled")
 _LIVE_STATUSES = ("queued", "running", "stopping")
 _STOPPABLE_STATUSES = ("queued", "running", "indeterminate", "deferred", "stopping")
 _RETRYABLE_STATUSES = ("indeterminate", "deferred")
+# Attempts a deadline may consume before the room stops reopening the turn by itself: the first try
+# plus one implied retry. Past this the failure stands and its explicit Retry is what remains.
+_DEADLINE_RETRY_ATTEMPTS = 2
 # Continue and the router answer re-read the log when an event lands between their read and their write.
 _FENCED_APPEND_ATTEMPTS = 3
 _APPROVABLE_STATUSES = ("running", "indeterminate", "deferred")
@@ -71,6 +74,11 @@ def task_member_id(task: Mapping[str, Any]) -> str:
 def _approvable_attempts(tasks) -> set[tuple[str, str, int]]:
     return {(task_member_id(task), task["identity"].task_id, task["execution_generation"])
             for task in tasks if task["status"] in _APPROVABLE_STATUSES}
+
+
+def _retryable(task: Mapping[str, Any]) -> bool:
+    """Whether this attempt's own row offers Retry: uncertain, deferred, or stopped at its time limit."""
+    return task["status"] in _RETRYABLE_STATUSES or driver.is_retryable_failure(task)
 
 
 def attempt_action(kind: str, task: Mapping[str, Any]) -> dict[str, Any]:
@@ -239,7 +247,8 @@ class HostedRoomService:
             maintain=self.retry_owed_revokes,
             poll_interval_seconds=_HOSTED_ROOM_IDLE_FALLBACK_SECONDS,
             active_poll_interval_seconds=_HOSTED_ROOM_ACTIVE_POLL_SECONDS,
-            turn_timeout_seconds=_hosted_room_turn_timeout_seconds())
+            turn_timeout_seconds=_hosted_room_turn_timeout_seconds(),
+            deadline_retry_attempts=_DEADLINE_RETRY_ATTEMPTS)
         with _live_services_lock:
             _live_services.add(self)
 
@@ -325,6 +334,16 @@ class HostedRoomService:
     def _list_tasks(self, room_id: str, statuses) -> Iterator[Mapping[str, Any]]:
         for status in statuses:
             yield from driver.list_tasks(self.db_path, room_id=room_id, status=status)
+
+    def _deadline_failures(self, room_id: str) -> list[dict[str, Any]]:
+        """Newest failure per member whose Retry the timeout implies: one card, not a wall."""
+        seen, failures = set(), []
+        for task in driver.deadline_failed_tasks(self.db_path, room_id=room_id):
+            member = task_member_id(task)
+            if member not in seen:
+                seen.add(member)
+                failures.append(task)
+        return failures
 
     def _save_link(self, **link: Any) -> None:
         """Persist one stored link (``make_stored_link`` keyword fields)."""
@@ -1085,7 +1104,9 @@ class HostedRoomService:
         """Retry one uncertain or deferred task only after explicit user action."""
         if task_id.startswith(prepare_stall.RETRY_TASK_PREFIX):
             return self._retry_preparation(room_id, task_id)
-        candidates = self._list_tasks(room_id, _RETRYABLE_STATUSES)
+        candidates = [
+            *self._list_tasks(room_id, _RETRYABLE_STATUSES),
+            *self._deadline_failures(room_id)]
         task = next((c for c in candidates if c["identity"].task_id == task_id
                      and member_id in (None, task_member_id(c))
                      and execution_generation in (None, c["execution_generation"])), None)
@@ -1166,7 +1187,7 @@ class HostedRoomService:
     def _attempt_actions(self, room_id: str, tasks_shown: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """The per-attempt actions ``status`` offers for the rows it already read, after the stall and approval
         cards: Retry each retryable one."""
-        return [attempt_action("retry", task) for task in tasks_shown if task["status"] in _RETRYABLE_STATUSES]
+        return [attempt_action("retry", task) for task in tasks_shown if _retryable(task)]
 
     def live_status_sig(self) -> dict[str, tuple]:
         """Per room, the parts of ``status(room_id)`` that only this service holds (no store write follows
@@ -1200,6 +1221,9 @@ class HostedRoomService:
         # Retained terminal tasks (up to thousands) are only counted; only the rows shown here are decoded.
         counts, tasks = driver.room_task_summary(
             self.db_path, room_id=room_id, statuses=driver.SHOWN_TASK_STATUSES)
+        # A turn stopped at its own time limit is the one terminal failure Retry may reopen; the
+        # summary counts terminal rows but never decodes them, so those attempts are read apart.
+        tasks = [*tasks, *self._deadline_failures(room_id)]
         pending_actions = []
         if self._prepare_stalls.stalled(room_id):
             pending_actions.append(prepare_stall.retry_action(room_id, self._room(room_id)))

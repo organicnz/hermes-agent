@@ -36,6 +36,12 @@ TASK_STATUSES = frozenset(get_args(TaskStatus))
 # The live rows a room's status shows one by one (member activity, Retry); the rest are only counted.
 SHOWN_TASK_STATUSES = ("queued", "running", "stopping", "indeterminate", "deferred")
 TERMINAL_STATUSES = frozenset({"settled", "failed", "cancelled"})
+# The one terminal failure Retry may reopen: the turn was still running when its own time limit cut
+# it off. Every other failed result is a verdict (member unavailable, superseded, unknown).
+TURN_DEADLINE_REASON = "turn_deadline_exceeded"
+# The timeout path's Stop marker ("deadline:<generation>"): it identifies a deadline stop inside the
+# Stop protocol (and is cleared when that attempt is reopened), never a lookup for retryable rows.
+DEADLINE_CANCEL_PREFIX = "deadline:"
 
 _TASK_PAYLOAD_REQUIRED_FIELDS = frozenset({"target_profile", "prompt", "source_event_seq"})
 _TASK_PAYLOAD_OPTIONAL_FIELDS = frozenset({"target_member_id", "input_context", "attachments", "lead_routing"})
@@ -61,6 +67,12 @@ _GENERATION_FENCE = "execution_generation=? AND cancel_generation=?"
 _RUN_FENCE = "run_gateway_id=? AND run_process_generation=? AND run_lease_generation=?"
 _SETTLE_SET = "status=?, settlement_id=?, settlement_status=?, result_json=?, terminal_at=?, updated_at=?"
 _REQUEUE_SET = "status='queued', run_gateway_id=NULL, run_process_generation=NULL, run_lease_generation=NULL"
+# A deadline-stopped attempt is reopened in place (implied or explicit retry): clearing the marker
+# and the settlement makes the next start a first start, and the next Stop (or deadline) mint its own
+# rather than inherit this attempt's.
+_REQUEUE_ATTEMPT_SET = (
+    f"{_REQUEUE_SET}, cancel_id=NULL, settlement_id=NULL, settlement_status=NULL, result_json=NULL, "
+    "terminal_at=NULL, started_at=NULL, indeterminate_at=NULL, updated_at=?")
 _CANCEL_SET = "status='cancelled', cancel_generation=?, cancel_id=?, terminal_at=?, updated_at=?"
 
 
@@ -366,6 +378,19 @@ def _task_from_row(row: sqlite3.Row, *, idempotent: bool = False) -> dict[str, A
         task["result" if column == "result_json" else column] = _TASK_VIEW_CASTS.get(column, lambda v: v)(row[column])
     task["idempotent"] = idempotent
     return task
+
+
+def is_retryable_failure(task: Mapping[str, Any]) -> bool:
+    """Whether a terminal ``failed`` task may be Retried: only a turn stopped at its own time limit.
+
+    A refusal (member unavailable, superseded, unknown) is the chat's outcome and stays terminal;
+    ``turn_deadline_exceeded`` means the work was still running when the clock cut it off, so its
+    Retry is implied by the failure itself rather than a decision someone has to re-derive.
+    """
+    if task.get("status") != "failed":
+        return False
+    result = task.get("result")
+    return isinstance(result, Mapping) and result.get("reason_code") == TURN_DEADLINE_REASON
 
 
 def _load_task(conn: sqlite3.Connection, identity: TaskIdentity, *, required: bool = True) -> sqlite3.Row | None:
@@ -817,6 +842,53 @@ def reopen_deferred_task(
         now=now, set_params=(now, now, now))
 
 
+def requeue_deadline_task(
+    db_path: DbPath, identity: TaskIdentity, lease: DriverLease, *, expected_execution_generation: int,
+    expected_cancel_generation: int, clock: Clock
+) -> dict[str, Any]:
+    """Reopen a turn its own deadline stopped: the implied retry while the room's budget lasts.
+
+    The Stop was acknowledged and the task still carries the deadline's own cancel marker, so
+    nothing is uncertain and nothing was produced: returning it to ``queued`` starts a fresh
+    attempt rather than replaying one. The marker is cleared so the new attempt arms its own.
+    """
+    _expected_generations(lease, identity, expected_execution_generation, expected_cancel_generation)
+    now = _timestamp(clock)
+    def guard(row: sqlite3.Row) -> None:
+        if not _generations_match(row, "stopping", expected_execution_generation, expected_cancel_generation):
+            raise StaleTaskError("stopping task generation changed")
+        if not str(row["cancel_id"] or "").startswith(DEADLINE_CANCEL_PREFIX):
+            raise InvalidTaskTransitionError("only a deadline stop is reopened automatically")
+    return _transition(
+        db_path, identity, lease=lease, now=now, guard=guard,
+        sql=_generation_update(_REQUEUE_ATTEMPT_SET, "stopping"),
+        set_params=(now,), fence_params=(expected_execution_generation, expected_cancel_generation),
+        stale="stopping task changed during deadline retry")
+
+
+def requeue_failed_task(
+    db_path: DbPath, identity: TaskIdentity, lease: DriverLease, *, expected_execution_generation: int,
+    expected_cancel_generation: int, clock: Clock
+) -> dict[str, Any]:
+    """Explicitly retry a turn that ran out of time: the one terminal failure Retry may reopen.
+
+    The row returns to ``queued`` at its same generations with its settlement cleared, so the next
+    ``start_task`` mints the new attempt exactly as a first start would.
+    """
+    _expected_generations(lease, identity, expected_execution_generation, expected_cancel_generation)
+    now = _timestamp(clock)
+    def guard(row: sqlite3.Row) -> None:
+        if not _generations_match(row, "failed", expected_execution_generation, expected_cancel_generation):
+            raise StaleTaskError("failed task generation changed")
+        if not is_retryable_failure(_task_from_row(row)):
+            raise InvalidTaskTransitionError("only a turn that exceeded its time limit can be retried")
+    return _transition(
+        db_path, identity, lease=lease, now=now, guard=guard,
+        sql=_generation_update(_REQUEUE_ATTEMPT_SET, "failed"),
+        set_params=(now,), fence_params=(expected_execution_generation, expected_cancel_generation),
+        stale="failed task changed during retry")
+
+
 def requeue_not_admitted_task(db_path: DbPath, attempt: TaskAttempt, *, clock: Clock) -> dict[str, Any]:
     """Return a running task to its durable queue after proven non-admission."""
     now = _timestamp(clock)
@@ -935,6 +1007,24 @@ def list_tasks(db_path: DbPath, *, room_id: Any, status: TaskStatus | None = Non
         raise DriverValidationError("invalid task status")
     with closing(_connect(db_path)) as conn:
         return [_task_from_row(row) for row in _tasks_in_order(conn, room_id, () if status is None else (status,))]
+
+
+def deadline_failed_tasks(db_path: DbPath, *, room_id: Any, limit: int = 20) -> list[dict[str, Any]]:
+    """One room's failed attempts whose Retry is implied, newest first, at most ``limit``.
+
+    ``reason_code`` is the room's one deadline-failure marker (see ``is_retryable_failure``), so
+    the reason alone selects exactly those rows. The Stop marker is not used: it is protocol state
+    for one attempt, and it survives on a row whose next failure is a different verdict. Reading
+    the reason in SQL keeps the status index as the scan and decodes only the rows returned.
+    """
+    room_id = _identifier(room_id, label="room_id")
+    with closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT * FROM hosted_room_driver_tasks WHERE room_id=? AND status='failed' "
+            "AND json_extract(result_json, '$.reason_code')=? "
+            "ORDER BY updated_at DESC, task_id DESC LIMIT ?",
+            (room_id, TURN_DEADLINE_REASON, max(0, int(limit)))).fetchall()
+    return [_task_from_row(row) for row in rows]
 
 
 def room_task_summary(
